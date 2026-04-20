@@ -173,7 +173,7 @@ int run_supervisor(const char *rootfs) {
 
 /* --- Main / Client --- */
 int main(int argc, char *argv[]) {
-    if (argc < 2) return 1;
+    if (argc < 2) { fprintf(stderr, "Usage: %s run <name> <rootfs> <cmd>\n", argv[0]); return 1; }
     if (strcmp(argv[1], "supervisor") == 0) return run_supervisor(argv[2]);
 
     control_request_t req = {0};
