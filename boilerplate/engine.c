@@ -58,6 +58,8 @@ typedef struct {
     char container_id[CONTAINER_ID_LEN];
     char rootfs[PATH_MAX];
     char command[256];
+    long soft_limit_mib;
+    long hard_limit_mib;
 } control_request_t;
 
 typedef struct {
@@ -131,6 +133,24 @@ int child_fn(void *arg) {
     return 0;
 }
 
+/* --- Helper: launch a container and record it --- */
+static pid_t launch_container(control_request_t *req) {
+    void *stack = malloc(STACK_SIZE);
+    pid_t pid = clone(child_fn, stack + STACK_SIZE,
+                      CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD, req);
+    if (pid < 0) return pid;
+
+    pthread_mutex_lock(&ctx.metadata_lock);
+    container_record_t *rec = malloc(sizeof(container_record_t));
+    strncpy(rec->id, req->container_id, CONTAINER_ID_LEN);
+    rec->host_pid = pid;
+    rec->state = CONTAINER_RUNNING;
+    rec->next = ctx.containers;
+    ctx.containers = rec;
+    pthread_mutex_unlock(&ctx.metadata_lock);
+    return pid;
+}
+
 /* --- Supervisor Event Loop --- */
 int run_supervisor(const char *rootfs) {
     mkdir(LOG_DIR, 0755);
@@ -151,20 +171,79 @@ int run_supervisor(const char *rootfs) {
         int cfd = accept(ctx.server_fd, NULL, NULL);
         control_request_t req;
         read(cfd, &req, sizeof(req));
-        control_response_t res = {0, "Container Processed"};
+        control_response_t res = {0, "Unknown command"};
 
-        if (req.kind == CMD_RUN) {
-            void *stack = malloc(STACK_SIZE);
-            pid_t pid = clone(child_fn, stack + STACK_SIZE, CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD, &req);
+        if (req.kind == CMD_RUN || req.kind == CMD_START) {
+            /* CMD_RUN and CMD_START both launch a container */
+            pid_t pid = launch_container(&req);
+            if (pid < 0)
+                snprintf(res.message, 255, "Failed to launch: %s (errno: %d)", req.container_id, errno);
+            else
+                snprintf(res.message, 255, "Started ID: %s (PID: %d)", req.container_id, pid);
+
+        } else if (req.kind == CMD_PS) {
+            /* List all known containers and their states */
             pthread_mutex_lock(&ctx.metadata_lock);
-            container_record_t *rec = malloc(sizeof(container_record_t));
-            strncpy(rec->id, req.container_id, CONTAINER_ID_LEN);
-            rec->host_pid = pid;
-            rec->next = ctx.containers;
-            ctx.containers = rec;
+            char buf[256] = "";
+            int n = 0;
+            container_record_t *c = ctx.containers;
+            while (c) {
+                /* Reap if exited */
+                int wstatus;
+                pid_t r = waitpid(c->host_pid, &wstatus, WNOHANG);
+                if (r > 0) c->state = CONTAINER_EXITED;
+
+                char entry[64];
+                snprintf(entry, sizeof(entry), "%s(%s) ",
+                         c->id,
+                         c->state == CONTAINER_RUNNING ? "running" : "exited");
+                strncat(buf, entry, sizeof(buf) - strlen(buf) - 1);
+                n++;
+                c = c->next;
+            }
             pthread_mutex_unlock(&ctx.metadata_lock);
-            snprintf(res.message, 255, "Launched ID: %s (PID: %d)", req.container_id, pid);
+            if (n == 0)
+                snprintf(res.message, 255, "No containers");
+            else
+                snprintf(res.message, 255, "%s", buf);
+
+        } else if (req.kind == CMD_LOGS) {
+            /* Read log file for the requested container */
+            char path[PATH_MAX];
+            snprintf(path, PATH_MAX, "%s/%s.log", LOG_DIR, req.container_id);
+            int lfd = open(path, O_RDONLY);
+            if (lfd < 0) {
+                snprintf(res.message, 255, "No logs found for: %s", req.container_id);
+            } else {
+                ssize_t n = read(lfd, res.message, sizeof(res.message) - 1);
+                if (n <= 0)
+                    snprintf(res.message, 255, "Log empty for: %s", req.container_id);
+                else
+                    res.message[n] = '\0';
+                close(lfd);
+            }
+
+        } else if (req.kind == CMD_STOP) {
+            /* Find, kill and remove the container record */
+            pthread_mutex_lock(&ctx.metadata_lock);
+            container_record_t *c = ctx.containers, *prev = NULL;
+            while (c && strncmp(c->id, req.container_id, CONTAINER_ID_LEN) != 0) {
+                prev = c;
+                c = c->next;
+            }
+            if (c) {
+                kill(c->host_pid, SIGKILL);
+                waitpid(c->host_pid, NULL, 0);
+                if (prev) prev->next = c->next;
+                else ctx.containers = c->next;
+                free(c);
+                snprintf(res.message, 255, "Stopped: %s", req.container_id);
+            } else {
+                snprintf(res.message, 255, "Not found: %s", req.container_id);
+            }
+            pthread_mutex_unlock(&ctx.metadata_lock);
         }
+
         write(cfd, &res, sizeof(res));
         close(cfd);
     }
@@ -173,26 +252,66 @@ int run_supervisor(const char *rootfs) {
 
 /* --- Main / Client --- */
 int main(int argc, char *argv[]) {
-    if (argc < 2) { fprintf(stderr, "Usage: %s run <name> <rootfs> <cmd>\n", argv[0]); return 1; }
-    if (strcmp(argv[1], "supervisor") == 0) return run_supervisor(argv[2]);
+    if (argc < 2) {
+        fprintf(stderr,
+            "Usage:\n"
+            "  %s supervisor <rootfs>\n"
+            "  %s start <name> <rootfs> <cmd> [--soft-mib N] [--hard-mib N]\n"
+            "  %s run   <name> <rootfs> <cmd>\n"
+            "  %s list\n"
+            "  %s logs  <name>\n"
+            "  %s stop  <name>\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+        return 1;
+    }
+
+    if (strcmp(argv[1], "supervisor") == 0)
+        return run_supervisor(argc >= 3 ? argv[2] : NULL);
 
     control_request_t req = {0};
-    if (strcmp(argv[1], "run") == 0 && argc >= 5) {
-        req.kind = CMD_RUN;
-        strncpy(req.container_id, argv[2], CONTAINER_ID_LEN-1);
-        strncpy(req.rootfs, argv[3], PATH_MAX-1);
-        strncpy(req.command, argv[4], 255);
+
+    if ((strcmp(argv[1], "run") == 0 || strcmp(argv[1], "start") == 0) && argc >= 5) {
+        req.kind = (strcmp(argv[1], "start") == 0) ? CMD_START : CMD_RUN;
+        strncpy(req.container_id, argv[2], CONTAINER_ID_LEN - 1);
+        strncpy(req.rootfs,       argv[3], PATH_MAX - 1);
+        strncpy(req.command,      argv[4], 255);
+
+        /* Parse optional --soft-mib / --hard-mib flags */
+        for (int i = 5; i < argc - 1; i++) {
+            if (strcmp(argv[i], "--soft-mib") == 0)
+                req.soft_limit_mib = atol(argv[++i]);
+            else if (strcmp(argv[i], "--hard-mib") == 0)
+                req.hard_limit_mib = atol(argv[++i]);
+        }
+
+    } else if (strcmp(argv[1], "list") == 0 || strcmp(argv[1], "ps") == 0) {
+        req.kind = CMD_PS;
+
+    } else if (strcmp(argv[1], "logs") == 0 && argc >= 3) {
+        req.kind = CMD_LOGS;
+        strncpy(req.container_id, argv[2], CONTAINER_ID_LEN - 1);
+
+    } else if (strcmp(argv[1], "stop") == 0 && argc >= 3) {
+        req.kind = CMD_STOP;
+        strncpy(req.container_id, argv[2], CONTAINER_ID_LEN - 1);
+
+    } else {
+        fprintf(stderr, "Unknown command or missing arguments: %s\n", argv[1]);
+        return 1;
     }
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path)-1);
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-        write(fd, &req, sizeof(req));
-        control_response_t res;
-        read(fd, &res, sizeof(res));
-        printf("Supervisor Response: %s\n", res.message);
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "Cannot connect to supervisor at %s\n", CONTROL_PATH);
+        close(fd);
+        return 1;
     }
+    write(fd, &req, sizeof(req));
+    control_response_t res;
+    read(fd, &res, sizeof(res));
+    printf("Supervisor Response: %s\n", res.message);
     close(fd);
     return 0;
 }
