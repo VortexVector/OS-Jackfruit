@@ -40,6 +40,14 @@
  *   - include `struct list_head` linkage
  * ============================================================== */
 
+struct monitored_entry {
+    struct list_head list;
+    pid_t pid;
+    char container_id[MONITOR_NAME_LEN];
+    unsigned long soft_limit_bytes;
+    unsigned long hard_limit_bytes;
+    bool soft_warned;
+};
 
 /* ==============================================================
  * TODO 2: Declare the global monitored list and a lock.
@@ -51,6 +59,9 @@
  * You may choose either a mutex or a spinlock, but your README must
  * justify the choice in terms of the code paths you implemented.
  * ============================================================== */
+
+static LIST_HEAD(monitored_list);
+static spinlock_t monitored_lock;
 
 
 /* --- Provided: internal device / timer state --- */
@@ -144,6 +155,27 @@ static void timer_callback(struct timer_list *t)
      *   - avoid use-after-free while deleting during iteration
      * ============================================================== */
 
+    spin_lock(&monitored_lock);
+    struct monitored_entry *entry, *tmp;
+    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+        long rss = get_rss_bytes(entry->pid);
+        if (rss == -1) {
+            // process exited, remove
+            list_del(&entry->list);
+            kfree(entry);
+            continue;
+        }
+        if (rss > entry->hard_limit_bytes) {
+            kill_process(entry->container_id, entry->pid, entry->hard_limit_bytes, rss);
+            list_del(&entry->list);
+            kfree(entry);
+        } else if (rss > entry->soft_limit_bytes && !entry->soft_warned) {
+            log_soft_limit_event(entry->container_id, entry->pid, entry->soft_limit_bytes, rss);
+            entry->soft_warned = true;
+        }
+    }
+    spin_unlock(&monitored_lock);
+
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
 
@@ -180,6 +212,17 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
          *   - insert into the shared list under the chosen lock
          * ============================================================== */
 
+        struct monitored_entry *new_entry = kmalloc(sizeof(*new_entry), GFP_KERNEL);
+        if (!new_entry) return -ENOMEM;
+        new_entry->pid = req.pid;
+        strncpy(new_entry->container_id, req.container_id, MONITOR_NAME_LEN);
+        new_entry->soft_limit_bytes = req.soft_limit_bytes;
+        new_entry->hard_limit_bytes = req.hard_limit_bytes;
+        new_entry->soft_warned = false;
+        spin_lock(&monitored_lock);
+        list_add(&new_entry->list, &monitored_list);
+        spin_unlock(&monitored_lock);
+
         return 0;
     }
 
@@ -196,6 +239,17 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
      *   - return status indicating whether a matching entry was removed
      * ============================================================== */
 
+    spin_lock(&monitored_lock);
+    struct monitored_entry *entry, *tmp;
+    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+        if (entry->pid == req.pid && strcmp(entry->container_id, req.container_id) == 0) {
+            list_del(&entry->list);
+            kfree(entry);
+            spin_unlock(&monitored_lock);
+            return 0;
+        }
+    }
+    spin_unlock(&monitored_lock);
     return -ENOENT;
 }
 
@@ -235,6 +289,7 @@ static int __init monitor_init(void)
         return -1;
     }
 
+    spin_lock_init(&monitored_lock);
     timer_setup(&monitor_timer, timer_callback, 0);
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 
@@ -254,6 +309,14 @@ static void __exit monitor_exit(void)
      *   - remove and free every list node safely
      *   - leave no leaked state on module unload
      * ============================================================== */
+
+    spin_lock(&monitored_lock);
+    struct monitored_entry *entry, *tmp;
+    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
+        list_del(&entry->list);
+        kfree(entry);
+    }
+    spin_unlock(&monitored_lock);
 
     cdev_del(&c_dev);
     device_destroy(cl, dev_num);

@@ -50,6 +50,7 @@ typedef struct container_record {
     char id[CONTAINER_ID_LEN];
     pid_t host_pid;
     container_state_t state;
+    int log_pipe_fd;
     struct container_record *next;
 } container_record_t;
 
@@ -60,6 +61,7 @@ typedef struct {
     char command[256];
     long soft_limit_mib;
     long hard_limit_mib;
+    int log_pipe_write_fd;
 } control_request_t;
 
 typedef struct {
@@ -111,6 +113,21 @@ int bb_pop(bounded_buffer_t *bb, log_item_t *item) {
 }
 
 /* --- Logging & Child Execution --- */
+void *pipe_reader(void *arg) {
+    container_record_t *rec = arg;
+    char buf[LOG_CHUNK_SIZE];
+    while (1) {
+        ssize_t n = read(rec->log_pipe_fd, buf, LOG_CHUNK_SIZE);
+        if (n <= 0) break;
+        log_item_t item;
+        strncpy(item.container_id, rec->id, CONTAINER_ID_LEN);
+        item.length = n;
+        memcpy(item.data, buf, n);
+        bb_push(&ctx.log_buffer, &item);
+    }
+    close(rec->log_pipe_fd);
+    return NULL;
+}
 void *logger_thread(void *arg) {
     log_item_t item;
     while (bb_pop(&ctx.log_buffer, &item) == 0) {
@@ -128,6 +145,9 @@ int child_fn(void *arg) {
     if (mount(req->rootfs, req->rootfs, NULL, MS_BIND, NULL) < 0) exit(1);
     if (chroot(req->rootfs) < 0 || chdir("/") < 0) exit(1);
     mount("proc", "/proc", "proc", 0, NULL);
+    dup2(req->log_pipe_write_fd, 1);
+    dup2(req->log_pipe_write_fd, 2);
+    close(req->log_pipe_write_fd);
     char *argv[] = {"/bin/sh", "-c", req->command, NULL};
     execvp(argv[0], argv);
     return 0;
@@ -135,6 +155,10 @@ int child_fn(void *arg) {
 
 /* --- Helper: launch a container and record it --- */
 static pid_t launch_container(control_request_t *req) {
+    int pipefd[2];
+    pipe(pipefd);
+    req->log_pipe_write_fd = pipefd[1];
+
     void *stack = malloc(STACK_SIZE);
     pid_t pid = clone(child_fn, stack + STACK_SIZE,
                       CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD, req);
@@ -145,9 +169,31 @@ static pid_t launch_container(control_request_t *req) {
     strncpy(rec->id, req->container_id, CONTAINER_ID_LEN);
     rec->host_pid = pid;
     rec->state = CONTAINER_RUNNING;
+    rec->log_pipe_fd = pipefd[0];
     rec->next = ctx.containers;
     ctx.containers = rec;
+
+    // Start pipe reader thread
+    pthread_t tid;
+    pthread_create(&tid, NULL, pipe_reader, rec);
+    pthread_detach(tid);
+
     pthread_mutex_unlock(&ctx.metadata_lock);
+
+    // Register with monitor if limits set
+    if (req->soft_limit_mib > 0 || req->hard_limit_mib > 0) {
+        int fd = open("/dev/container_monitor", O_RDWR);
+        if (fd >= 0) {
+            struct monitor_request mon_req;
+            mon_req.pid = pid;
+            strncpy(mon_req.container_id, req->container_id, MONITOR_NAME_LEN);
+            mon_req.soft_limit_bytes = req->soft_limit_mib * 1024 * 1024;
+            mon_req.hard_limit_bytes = req->hard_limit_mib * 1024 * 1024;
+            ioctl(fd, MONITOR_REGISTER, &mon_req);
+            close(fd);
+        }
+    }
+
     return pid;
 }
 
@@ -234,6 +280,17 @@ int run_supervisor(const char *rootfs) {
             if (c) {
                 kill(c->host_pid, SIGKILL);
                 waitpid(c->host_pid, NULL, 0);
+
+                // Unregister from monitor
+                int fd = open("/dev/container_monitor", O_RDWR);
+                if (fd >= 0) {
+                    struct monitor_request mon_req;
+                    mon_req.pid = c->host_pid;
+                    strncpy(mon_req.container_id, c->id, MONITOR_NAME_LEN);
+                    ioctl(fd, MONITOR_UNREGISTER, &mon_req);
+                    close(fd);
+                }
+
                 if (prev) prev->next = c->next;
                 else ctx.containers = c->next;
                 free(c);
